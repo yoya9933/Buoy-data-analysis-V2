@@ -163,10 +163,25 @@ def load_single_file(file_path):
         return None
 
 @st.cache_data(ttl=3600)
-def load_year_data(base_data_path, station, year):
-    """載入並合併指定測站和年份的所有月份資料。"""
+def load_year_data(base_data_path, station_id_or_name, year):
+    """載入並合併指定測站和年份的所有月份資料。
+    
+    Args:
+        base_data_path: 基礎數據路徑 (如 dataset/buoy)
+        station_id_or_name: 可以是 StationID (如 "1456") 或測站名稱 (如 "基隆東北海域")
+        year: 年份
+    """
     monthly_dfs = []
-    dataset_path = os.path.join(base_data_path, station)
+    
+    # 如果傳入的是 StationID，則轉換為測站名稱
+    station_name = station_id_or_name
+    if hasattr(st, 'session_state') and 'devices' in st.session_state:
+        # 檢查是否為 StationID
+        station_map = {d['StationID']: d for d in st.session_state['devices']}
+        if station_id_or_name in station_map:
+            station_name = station_map[station_id_or_name].get('Title', station_id_or_name)
+    
+    dataset_path = os.path.join(base_data_path, station_name)
 
     # 載入該年度所有月份的檔案
     for month in range(1, 13):
@@ -191,13 +206,17 @@ def load_year_data(base_data_path, station, year):
 
     return combined_df.reset_index(drop=True)
 
-def load_data_for_prediction_page(station_name, param_col, start_date, end_date):
+def load_data_for_prediction_page(station_id_or_name, param_col, start_date, end_date):
+    """載入用於預測的數據。接受 StationID 或測站名稱。"""
     df_list = []
     base_data_path_full = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', BASE_DATA_PATH_FROM_CONFIG))
     years_to_load = range(start_date.year, end_date.year + 1)
     
+    # 確保使用正確的測站名稱或 ID
+    station_param = station_id_or_name
+    
     for year in years_to_load:
-        df_year = load_year_data(base_data_path_full, station_name, year)
+        df_year = load_year_data(base_data_path_full, station_param, year)
         if df_year is not None and not df_year.empty and 'time' in df_year.columns:
             df_year = df_year.set_index('time')
             df_list.append(df_year)
@@ -207,9 +226,17 @@ def load_data_for_prediction_page(station_name, param_col, start_date, end_date)
     combined_df = pd.concat(df_list)
     combined_df = combined_df[~combined_df.index.duplicated(keep='first')].sort_index()
 
+    # 時區處理：確保索引是時區天真的
+    if combined_df.index.tz is not None:
+        combined_df.index = combined_df.index.tz_localize(None)
+    
+    # 確保 start_date 和 end_date 也是時區天真的
+    start_dt = pd.to_datetime(start_date).tz_localize(None) if pd.to_datetime(start_date).tz is not None else pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date).tz_localize(None) if pd.to_datetime(end_date).tz is not None else pd.to_datetime(end_date)
+
     combined_df = combined_df[
-        (combined_df.index.to_series() >= pd.to_datetime(start_date)) &
-        (combined_df.index.to_series() <= pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1))
+        (combined_df.index >= start_dt) &
+        (combined_df.index <= end_dt + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1))
     ].copy()
 
     if combined_df.empty or param_col not in combined_df.columns: return pd.DataFrame()
@@ -347,7 +374,7 @@ def load_data(station_id, param_info_map):
     # 使用 st.expander 將所有的載入訊息包裹起來
     with st.expander(f"查看測站 '{station_name}' 的數據載入日誌"):
         st.info(f"嘗試從基本路徑 `{st.session_state.base_data_path}` 載入測站 `{station_name}` 的數據。")
-        station_data_path = os.path.join(st.session_state.base_data_path, station_id)
+        station_data_path = os.path.join(st.session_state.base_data_path, station_name)
 
         all_dfs = []
         found_any_file = False
