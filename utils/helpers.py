@@ -12,7 +12,6 @@ import chardet
 # Optional: For Matplotlib related functions, if you still use them in other parts of your app
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
-from tensorflow import norm
 
 # --- 全局配置變數 (在模組載入時初始化) ---
 PARAMETER_INFO = {}
@@ -21,6 +20,7 @@ DATA_SUBFOLDERS_PRIORITY = []
 BASE_DATA_PATH_FROM_CONFIG = "/dataset/buoy"
 CHINESE_FONT_NAME = None # 用於 Streamlit Plotly 圖表的中文字體名稱
 CHINESE_FONT_PATH_FULL = None # 用於 Matplotlib 的中文字體完整路徑
+STATION_COORDS = {}  # 用於儲存測站座標
 
 # --- 載入配置檔 ---
 def load_app_config_and_font():
@@ -523,8 +523,20 @@ def initialize_session_state():
     if 'chinese_font_name' not in st.session_state: # 新增：Plotly 需要字體名稱
         st.session_state.chinese_font_name = CHINESE_FONT_NAME
     if 'devices' not in st.session_state:
-        with open(os.path.join(BASE_DATA_PATH_FROM_CONFIG, "devices.json"), 'r', encoding='utf-8') as f:
-            st.session_state.devices = json.load(f)
+        # 將相對路徑轉換為絕對路徑
+        base_path_absolute = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', BASE_DATA_PATH_FROM_CONFIG))
+        devices_json_path = os.path.join(base_path_absolute, "devices.json")
+        
+        if os.path.exists(devices_json_path):
+            try:
+                with open(devices_json_path, 'r', encoding='utf-8') as f:
+                    st.session_state.devices = json.load(f)
+            except Exception as e:
+                st.warning(f"無法載入 devices.json: {e}")
+                st.session_state.devices = []
+        else:
+            st.warning(f"devices.json 不存在於 {devices_json_path}，使用空列表")
+            st.session_state.devices = []
     if 'parameter_info' not in st.session_state:
         st.session_state.parameter_info = PARAMETER_INFO
     if 'data_subfolders_priority' not in st.session_state:
