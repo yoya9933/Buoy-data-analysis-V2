@@ -187,7 +187,7 @@ class AccuracyHistory(Callback):
     # 1. 將所有計算邏輯移到一個新函式中，並接收 model 作為參數
     def calculate_metrics(self, model):
         """手動計算並記錄一次準確率和相關係數"""
-        train_pred_scaled = model.predict(self.X_train, verbose=0)
+        train_pred_scaled = model.predict(self.X_train)
         train_actual_scaled = self.y_train.reshape(-1, 1)
         train_pred_original = self.scaler.inverse_transform(train_pred_scaled)
         train_actual_original = self.scaler.inverse_transform(train_actual_scaled)
@@ -198,7 +198,7 @@ class AccuracyHistory(Callback):
             self.train_correlations.append(train_corr)
         else: self.train_correlations.append(np.nan)
 
-        val_pred_scaled = model.predict(self.X_test, verbose=0)
+        val_pred_scaled = model.predict(self.X_test)
         val_actual_scaled = self.y_test.reshape(-1, 1)
         val_pred_original = self.scaler.inverse_transform(val_pred_scaled)
         val_actual_original = self.scaler.inverse_transform(val_actual_scaled)
@@ -272,6 +272,24 @@ if not df_initial_check.empty:
         
         if target_col_to_check and pd.api.types.is_numeric_dtype(df_initial_check[target_col_to_check]) and df_initial_check[target_col_to_check].count() > 0:
             available_predictable_params_display_to_col[display_name] = target_col_to_check
+
+    if not available_predictable_params_display_to_col:
+        for col_name in df_initial_check.select_dtypes(include=['number']).columns:
+            if col_name == 'ds':
+                continue
+
+            matched_display_name = None
+            for param_key, param_info in st.session_state.get('parameter_info', {}).items():
+                expected_names = [
+                    str(param_key).lower(),
+                    str(param_info.get('column_name_in_data', param_key)).lower(),
+                    str(param_info.get('display_zh', '')).lower(),
+                ]
+                if col_name.lower() in expected_names:
+                    matched_display_name = param_info.get('display_zh', col_name)
+                    break
+
+            available_predictable_params_display_to_col[matched_display_name or col_name] = col_name
 
 if not available_predictable_params_display_to_col:
     st.sidebar.error("載入數據後，沒有可供預測的有效數值型參數。")
@@ -406,8 +424,7 @@ if st.sidebar.button("🌊 執行 LSTM 預測"):
             # 2. 將 progress_callback 加入 callbacks 列表
             history = model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, 
                                 validation_data=(X_test, y_test), 
-                                callbacks=[early_stopping, accuracy_history_callback, progress_callback], 
-                                verbose=0)
+                                callbacks=[early_stopping, accuracy_history_callback, progress_callback])
             history_data = history.history
         except Exception as e:
             st.error(f"LSTM 模型訓練失敗：{e}")
@@ -417,6 +434,7 @@ if st.sidebar.button("🌊 執行 LSTM 預測"):
         save_local_model(model, scaler, history_data, model_params)
     else:
         st.success("✅ 成功載入快取模型！")
+        assert scaler is not None
         with st.spinner("STEP 2/3: 正在準備數據..."):
             scaled_data = scaler.transform(df_processed['y'].values.reshape(-1, 1))
             X, y = create_sequences(scaled_data, look_back)
@@ -426,6 +444,8 @@ if st.sidebar.button("🌊 執行 LSTM 預測"):
             X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
             X_test = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
             accuracy_history_callback = AccuracyHistory(X_train, y_train, X_test, y_test, scaler, epsilon_value, look_back)
+
+    assert scaler is not None
 
     with st.spinner("STEP 3/3: 正在評估與視覺化..."):
         st.subheader("📚 訓練數據概覽")
@@ -545,7 +565,7 @@ if st.sidebar.button("🌊 執行 LSTM 預測"):
         last_sequence = scaled_data[-look_back:]
         future_predictions = []
         for _ in range(forecast_period_value):
-            next_pred = model.predict(last_sequence.reshape(1, look_back, 1), verbose=0)[0, 0]
+            next_pred = model.predict(last_sequence.reshape(1, look_back, 1))[0, 0]
             future_predictions.append(next_pred)
             last_sequence = np.append(last_sequence[1:], [[next_pred]], axis=0)
         future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
@@ -554,7 +574,12 @@ if st.sidebar.button("🌊 執行 LSTM 預測"):
         if selected_freq_pandas in ['ME', 'YE']:
             future_start_date = last_known_date
         else:
-            future_start_date = last_known_date + pd.to_timedelta(1, unit=selected_freq_pandas[0])
+            freq_offsets = {
+                'h': pd.Timedelta(hours=1),
+                'D': pd.Timedelta(days=1),
+                'W': pd.Timedelta(weeks=1),
+            }
+            future_start_date = last_known_date + freq_offsets[selected_freq_pandas]
 
         future_dates = pd.date_range(start=future_start_date, periods=forecast_period_value, freq=selected_freq_pandas)
         forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': future_predictions.flatten()})

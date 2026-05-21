@@ -104,6 +104,57 @@ def convert_df_to_csv(df):
         return pd.DataFrame().to_csv(index=False).encode('utf-8')
     return df.to_csv(index=False).encode('utf-8')
 
+
+CSV_COLUMN_ALIASES = {
+    "時間": "time",
+    "觀測時間": "time",
+    "date": "time",
+    "datetime": "time",
+    "風速": "Wind_Speed",
+    "陣風": "Wind_Gust_Speed",
+    "陣風風速": "Wind_Gust_Speed",
+    "風向": "Wind_Direction",
+    "示性波高": "Wave_Height_Significant",
+    "平均週期": "Wave_Mean_Period",
+    "平均波週期": "Wave_Mean_Period",
+    "波向": "Wave_Main_Direction",
+    "波浪尖峰週期": "Wave_Peak_Period",
+    "氣壓": "Air_Pressure",
+    "氣溫": "Air_Temperature",
+    "海溫": "Sea_Temperature",
+    "海面溫度": "Sea_Temperature",
+    "流速": "Current_Speed",
+    "流向": "Current_Direction",
+    "潮高": "Tide_Height",
+}
+
+
+def _normalize_column_name(col_name: str) -> str:
+    cleaned = str(col_name).strip().replace("\ufeff", "")
+    return CSV_COLUMN_ALIASES.get(cleaned, cleaned)
+
+
+def _extract_station_name_from_filename(file_name: str) -> str:
+    base = os.path.splitext(file_name)[0]
+    # 例如: 鵝鑾鼻資料浮標202201~202406(有時間) -> 鵝鑾鼻
+    for token in ["資料浮標", "浮標", "_", "-"]:
+        if token in base:
+            return base.split(token)[0].strip()
+    return base.strip()
+
+
+def _find_standalone_station_csv(base_data_path: str, station_id_or_name: str) -> Optional[str]:
+    if not os.path.isdir(base_data_path):
+        return None
+
+    station_key = str(station_id_or_name).strip().lower()
+    csv_files = glob(os.path.join(base_data_path, "*.csv")) + glob(os.path.join(base_data_path, "*.CSV"))
+    for csv_path in sorted(csv_files):
+        station_name = _extract_station_name_from_filename(os.path.basename(csv_path))
+        if station_key in [station_name.lower(), os.path.basename(csv_path).lower()]:
+            return csv_path
+    return None
+
 @st.cache_data(ttl=3600)
 def load_single_file(file_path):
     """載入並清理單一月份的 CSV 檔案。"""
@@ -120,19 +171,55 @@ def load_single_file(file_path):
         for encoding in encodings_to_try:
             if encoding:
                 try:
-                    df = pd.read_csv(file_path, delimiter=',', on_bad_lines='warn', header=None, low_memory=False, encoding=encoding)
+                    # 先使用一般單列標頭格式；失敗時再回退到舊版多列標頭格式
+                    df = pd.read_csv(file_path, delimiter=',', on_bad_lines='warn', header=0, low_memory=False, encoding=encoding)
                     break
                 except (UnicodeDecodeError, pd.errors.ParserError):
                     continue
 
-        if df is None or len(df) < 3:
+        if df is None or df.empty:
             return None
 
-        # 處理標頭並清理欄位名稱
-        english_headers = df.iloc[1].astype(str).str.strip()
-        df.columns = english_headers
-        df = df[3:].reset_index(drop=True)
-        df.columns = df.columns.str.strip()
+        # 移除空白欄位名稱前，先嘗試保留最後一欄時間資料
+        df.columns = [str(c).strip() for c in df.columns]
+        unnamed_time_cols = []
+        for col in df.columns:
+            if not col.lower().startswith('unnamed:'):
+                continue
+            parsed_col = pd.to_datetime(df[col], errors='coerce')
+            valid_ratio = parsed_col.notna().sum() / len(parsed_col) if len(parsed_col) > 0 else 0
+            if valid_ratio > 0.5:
+                unnamed_time_cols.append(col)
+
+        if unnamed_time_cols:
+            time_source_col = unnamed_time_cols[0]
+            df.rename(columns={time_source_col: 'time'}, inplace=True)
+
+        df = df.loc[:, [c for c in df.columns if c and not (c.lower().startswith('unnamed:') and c != 'time')]].copy()
+
+        # 若未找到有效欄位，回退到舊版三列標頭格式
+        if not any(df.columns):
+            df = None
+            for encoding in encodings_to_try:
+                if encoding:
+                    try:
+                        legacy_df = pd.read_csv(file_path, delimiter=',', on_bad_lines='warn', header=None, low_memory=False, encoding=encoding)
+                        if legacy_df is not None and len(legacy_df) >= 3:
+                            english_headers = legacy_df.iloc[1].astype(str).str.strip()
+                            legacy_df.columns = english_headers
+                            df = legacy_df[3:].reset_index(drop=True)
+                            break
+                    except (UnicodeDecodeError, pd.errors.ParserError):
+                        continue
+
+            if df is None or df.empty:
+                return None
+
+        # 欄位正規化 (中文 -> 既有英文欄位 key)
+        normalized_columns = [_normalize_column_name(c) for c in df.columns]
+        df.columns = normalized_columns
+        # 若映射造成重複欄位，保留第一個
+        df = df.loc[:, ~pd.Index(df.columns).duplicated(keep='first')]
 
         # --- 自動尋找並重新命名時間欄位 ---
         time_col_candidates = ['time', 'Time', '觀測時間', 'Date', 'datetime', 'Datetime', '時間']
@@ -192,6 +279,17 @@ def load_year_data(base_data_path, station_id_or_name, year):
                 monthly_dfs.append(df_month)
                 
     if not monthly_dfs:
+        # fallback: 支援 dataset/buoy 根目錄下單一長時間 CSV
+        standalone_file = _find_standalone_station_csv(base_data_path, station_name)
+        if standalone_file is None and station_name != station_id_or_name:
+            standalone_file = _find_standalone_station_csv(base_data_path, station_id_or_name)
+
+        if standalone_file:
+            df_full = load_single_file(standalone_file)
+            if df_full is not None and not df_full.empty and 'time' in df_full.columns:
+                df_full = df_full[df_full['time'].dt.year == int(year)].copy()
+                if not df_full.empty:
+                    return df_full.sort_values(by='time').drop_duplicates(subset=['time'], keep='first').reset_index(drop=True)
         return None
 
     combined_df = pd.concat(monthly_dfs, ignore_index=True)
@@ -297,12 +395,13 @@ def prepare_windrose_data(df):
     df_wind.dropna(inplace=True)
     if df_wind.empty: return None
 
-    dir_bins = np.arange(-11.25, 370.0, 22.5)
+    dir_bins = list(np.arange(-11.25, 370.0, 22.5))
     dir_labels = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
     speed_bins = [-1, 2, 4, 6, 8, 10, 12, np.inf]
     speed_labels = ['0-2 m/s', '2-4 m/s', '4-6 m/s', '6-8 m/s', '8-10 m/s', '10-12 m/s', '>12 m/s']
 
-    df_wind['direction_bin'] = pd.cut((df_wind['Wind_Direction'] + 11.25) % 360, bins=dir_bins, labels=dir_labels, right=False)
+    direction_values = pd.Series((df_wind['Wind_Direction'] + 11.25) % 360, index=df_wind.index)
+    df_wind['direction_bin'] = pd.cut(direction_values, bins=dir_bins, labels=dir_labels, right=False)
     df_wind['speed_bin'] = pd.cut(df_wind['Wind_Speed'], bins=speed_bins, labels=speed_labels, right=True)
 
     windrose_df = df_wind.groupby(['direction_bin', 'speed_bin'], observed=False).size().reset_index(name='frequency')
@@ -326,6 +425,18 @@ def get_available_years(base_data_path_from_config, locations):
                 if match:
                     all_years.add(int(match.group(1)))
                     
+    # fallback: 支援 base 路徑直接放 CSV 的型態
+    if not all_years:
+        standalone_csv = glob(os.path.join(base_data_path_full, '*.csv')) + glob(os.path.join(base_data_path_full, '*.CSV'))
+        for csv_path in standalone_csv:
+            try:
+                df_tmp = load_single_file(csv_path)
+                if df_tmp is not None and not df_tmp.empty and 'time' in df_tmp.columns:
+                    years = df_tmp['time'].dropna().dt.year.unique().tolist()
+                    all_years.update(int(y) for y in years)
+            except Exception:
+                continue
+
     if not all_years:
         current_year = pd.Timestamp.now().year
         return list(range(current_year - 5, current_year + 1))
@@ -380,80 +491,34 @@ def load_data(station_id, param_info_map):
         found_any_file = False
 
         csv_files = glob(os.path.join(station_data_path, '*.csv')) + glob(os.path.join(station_data_path, '*.CSV'))
+        if not csv_files:
+            standalone_file = _find_standalone_station_csv(st.session_state.base_data_path, station_name)
+            if standalone_file:
+                csv_files = [standalone_file]
+
         if csv_files:
-            st.info(f"在 `{station_data_path}` 中找到 {len(csv_files)} 個 CSV 檔案。")
+            st.info(f"共找到 {len(csv_files)} 個 CSV 檔案可供載入。")
             found_any_file = True
             for file_path in sorted(csv_files):
                 try:
-                    encodings = ['utf-8', 'latin1', 'big5', 'cp950']
-                    df_part = None
-                    for enc in encodings:
-                        try:
-                            df_part = pd.read_csv(file_path, header=1, encoding=enc, engine='python')
-                            break
-                        except UnicodeDecodeError:
-                            continue
-                    if df_part is None:
-                        st.warning(f"文件 '{file_path}' 無法使用常見編碼解析。跳過此文件。")
+                    df_part = load_single_file(file_path)
+                    if df_part is None or df_part.empty or 'time' not in df_part.columns:
+                        st.warning(f"文件 '{file_path}' 無法解析出有效的時間序列資料。跳過此文件。")
                         continue
 
-                    possible_time_cols = ['Time', 'time', 'UTC', 'GMT', 'Local_Time', 'Date', 'DateTime', 'TIME_UTC', 'Time (UTC)', 'time(UTC)', 'Time (LST)']
-                    
-                    # 清理列名，確保匹配時不會因為空格或大小寫問題錯過
-                    df_part.columns = df_part.columns.str.strip().str.lower()
-                    actual_time_cols_in_df = [col for col in df_part.columns if col in [pc.lower() for pc in possible_time_cols]]
-                    
-                    # --- 修正點 1: 更魯棒的日期時間解析 ---
-                    # 定義多種可能的日期時間格式
-                    possible_date_formats = [
-                        '%Y/%m/%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', 
-                        '%Y/%m/%d %H:%M', '%Y-%m-%d %H:%M',      
-                        '%Y/%m/%d', '%Y-%m-%d',                  
-                        '%m/%d/%Y %H:%M:%S', '%d-%m-%Y %H:%M:%S', 
-                        '%m/%d/%Y %H:%M', '%d-%m-%Y %H:%M',      
-                        '%m/%d/%Y', '%d-%m-%Y',                  
-                        '%Y%m%d%H%M%S', 
-                        '%Y%m%d'      
-                    ]
-                    
-                    found_time_col_and_parsed = False
-                    for col in actual_time_cols_in_df:
-                        # 嘗試使用明確格式解析
-                        for fmt in possible_date_formats:
-                            parsed_dates = pd.to_datetime(df_part[col], format=fmt, errors='coerce')
-                            valid_time_ratio = parsed_dates.count() / len(df_part) if len(df_part) > 0 else 0
-                            if valid_time_ratio > 0.5: # 如果超過一半的日期成功解析
-                                df_part['ds'] = parsed_dates
-                                found_time_col_and_parsed = True
-                                st.info(f"文件 '{file_path}' 的時間列 '{col}' 已使用格式 '{fmt}' 成功解析。")
-                                break 
-                        if found_time_col_and_parsed:
-                            break 
-
-                    if not found_time_col_and_parsed:
-                        # 如果所有明確格式都失敗，最後嘗試自動推斷（可能產生 UserWarning）
-                        for col in actual_time_cols_in_df:
-                            parsed_dates = pd.to_datetime(df_part[col], errors='coerce', infer_datetime_format=True)
-                            valid_time_ratio = parsed_dates.count() / len(df_part) if len(df_part) > 0 else 0
-                            if valid_time_ratio > 0.5:
-                                df_part['ds'] = parsed_dates
-                                found_time_col_and_parsed = True
-                                st.warning(f"文件 '{file_path}' 的時間列 '{col}' 無法從預設格式中解析，已嘗試自動推斷格式 (可能較慢)。")
-                                break
-                            
-                    if not found_time_col_and_parsed or df_part['ds'].isnull().all():
-                        st.warning(f"文件 '{file_path}' 中未找到有效的時間列或時間格式無法解析。跳過此文件。")
-                        continue
-                    
-                    df_part.set_index('ds', inplace=True)
+                    df_part = df_part.rename(columns={'time': 'ds'}).set_index('ds')
                     all_dfs.append(df_part)
                 except Exception as e:
                     st.warning(f"載入或處理文件 '{file_path}' 時發生錯誤：{e}。跳過此文件。")
                     continue
 
         if not found_any_file:
-            st.error(f"錯誤：在測站 '{station_name}' 的任何指定子文件夾中都沒有找到有效的數據文件。")
-            st.info(f"預期的測站數據根路徑: `{station_data_path}`")
+            st.error(f"錯誤：找不到測站 '{station_name}' 的可用數據文件。")
+            st.info(
+                "已嘗試兩種路徑："
+                f"(1) 測站資料夾 {station_data_path}；"
+                f"(2) 根目錄 {st.session_state.base_data_path} 的單檔 CSV。"
+            )
             return pd.DataFrame()
 
         if not all_dfs:
@@ -465,23 +530,42 @@ def load_data(station_id, param_info_map):
     combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
 
     cleaned_df = combined_df.copy() 
+    columns_by_lower = {str(c).lower(): c for c in cleaned_df.columns}
 
     final_cols_to_keep = []
     # 遍歷參數資訊映射，找出要保留的列
     for param_key, param_info in param_info_map.items():
-        param_col_in_data = param_info.get("column_name_in_data", param_key).lower()
-        if param_col_in_data in cleaned_df.columns:
+        candidates = [
+            str(param_key),
+            str(param_info.get("column_name_in_data", param_key)),
+            str(_normalize_column_name(param_key)),
+            str(_normalize_column_name(param_info.get("column_name_in_data", param_key))),
+        ]
+
+        resolved_col = None
+        for c in candidates:
+            c_lower = c.lower()
+            if c in cleaned_df.columns:
+                resolved_col = c
+                break
+            if c_lower in columns_by_lower:
+                resolved_col = columns_by_lower[c_lower]
+                break
+
+        if resolved_col:
             # 嘗試轉換為數字，處理非數值數據
-            cleaned_df[param_col_in_data] = pd.to_numeric(cleaned_df[param_col_in_data], errors='coerce')
-            valid_ratio = cleaned_df[param_col_in_data].count() / len(cleaned_df) if len(cleaned_df) > 0 else 0
+            cleaned_df[resolved_col] = pd.to_numeric(cleaned_df[resolved_col], errors='coerce')
+            valid_ratio = cleaned_df[resolved_col].count() / len(cleaned_df) if len(cleaned_df) > 0 else 0
 
             # 根據參數類型和有效數據比例決定是否保留
             if param_info.get("type") in ["linear", "circular"] and valid_ratio > 0.1: # 至少10%的有效數據
-                final_cols_to_keep.append(param_col_in_data)
+                final_cols_to_keep.append(resolved_col)
             else:
                 st.info(f"列 '{param_key}' (顯示名稱: {param_info.get('display_zh', 'N/A')}) 因數據類型不符、空值過多 ({valid_ratio*100:.2f}%) 或未配置為線性/圓形類型而被排除在主要分析之外。")
         else:
             st.info(f"配置文件中的參數 '{param_info.get('display_zh', param_key)}' (原始列名: '{param_key}') 未在數據文件中找到。")
+
+    final_cols_to_keep = list(dict.fromkeys(final_cols_to_keep))
     
     # 檢查 final_cols_to_keep 是否有內容
     if not final_cols_to_keep:
@@ -506,7 +590,10 @@ def get_station_from_id(station_id):
     return station_map.get(station_id, station_id)
 
 def get_station_name_from_id(station_id):
-    return get_station_from_id(station_id).get('Title', station_id)
+    station = get_station_from_id(station_id)
+    if isinstance(station, dict):
+        return station.get('Title', station_id)
+    return str(station)
 
 def analyze_navigability(df, wave_threshold, wind_threshold):
     if df is None or df.empty or 'Wave_Height_Significant' not in df.columns or 'Wind_Speed' not in df.columns: return np.nan
@@ -558,12 +645,41 @@ def initialize_session_state():
             try:
                 with open(devices_json_path, 'r', encoding='utf-8') as f:
                     st.session_state.devices = json.load(f)
+                st.session_state.data_layout_mode = 'station_folders'
             except Exception as e:
                 st.warning(f"無法載入 devices.json: {e}")
                 st.session_state.devices = []
+                st.session_state.data_layout_mode = 'unknown'
         else:
-            st.warning(f"devices.json 不存在於 {devices_json_path}，使用空列表")
-            st.session_state.devices = []
+            # fallback: 若沒有 devices.json，根據 base 目錄下 CSV 自動建立測站清單
+            detected_devices = []
+            try:
+                csv_files = glob(os.path.join(base_path_absolute, '*.csv')) + glob(os.path.join(base_path_absolute, '*.CSV'))
+                seen_station_names = set()
+                for csv_path in sorted(csv_files):
+                    station_name = _extract_station_name_from_filename(os.path.basename(csv_path))
+                    if not station_name or station_name in seen_station_names:
+                        continue
+                    seen_station_names.add(station_name)
+                    detected_devices.append({
+                        "StationID": station_name,
+                        "Title": station_name,
+                        "CenterLatitude": np.nan,
+                        "CenterLongitude": np.nan
+                    })
+            except Exception:
+                detected_devices = []
+
+            if detected_devices:
+                st.info(f"未找到 devices.json，已從根目錄 CSV 偵測到 {len(detected_devices)} 個測站。")
+                st.session_state.data_layout_mode = 'standalone_csv'
+            else:
+                st.warning(f"devices.json 不存在於 {devices_json_path}，且未偵測到可用 CSV。")
+                st.session_state.data_layout_mode = 'unknown'
+            st.session_state.devices = detected_devices
+
+    if 'data_layout_mode' not in st.session_state:
+        st.session_state.data_layout_mode = 'unknown'
     if 'parameter_info' not in st.session_state:
         st.session_state.parameter_info = PARAMETER_INFO
     if 'data_subfolders_priority' not in st.session_state:
