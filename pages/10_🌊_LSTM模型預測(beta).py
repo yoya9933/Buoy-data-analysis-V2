@@ -316,7 +316,10 @@ else:
     min_date_available = pd.to_datetime('1990-01-01').date()
     max_date_available = pd.Timestamp.now().date()
 
-train_start_date = st.sidebar.date_input("訓練數據開始日期:", value=min_date_available, min_value=min_date_available, max_value=max_date_available, key='pages_10_train_start_date')
+# 計算預設的開始日期（結束日期前推 3 天，並確保不早於資料中的最小日期）
+default_start_date = max(min_date_available, (pd.to_datetime(max_date_available) - pd.Timedelta(days=3)).date())
+
+train_start_date = st.sidebar.date_input("訓練數據開始日期:", value=default_start_date, min_value=min_date_available, max_value=max_date_available, key='pages_10_train_start_date')
 train_end_date = st.sidebar.date_input("訓練數據結束日期:", value=max_date_available, min_value=min_date_available, max_value=max_date_available, key='pages_10_train_end_date')
 
 if train_start_date >= train_end_date:
